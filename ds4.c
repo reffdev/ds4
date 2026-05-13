@@ -13553,6 +13553,7 @@ static bool metal_graph_verify_suffix_tops(
                                             start,
                                             n_tokens);
     }
+    const double vp_encode = verify_profile ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
 
@@ -13581,8 +13582,10 @@ static bool metal_graph_verify_suffix_tops(
 
     if (verify_profile) {
         const double vp_done = now_sec();
-        fprintf(stderr, "ds4: verify profile n=%u layers=%.3f ms output_head=%.3f ms total=%.3f ms\n",
+        fprintf(stderr, "ds4: verify profile n=%u encode=%.3f ms gpu_sync=%.3f ms layers=%.3f ms output_head=%.3f ms total=%.3f ms\n",
                 n_tokens,
+                (vp_encode - vp_t0) * 1000.0,
+                (vp_layers - vp_encode) * 1000.0,
                 (vp_layers - vp_t0) * 1000.0,
                 (vp_done - vp_layers) * 1000.0,
                 (vp_done - vp_t0) * 1000.0);
