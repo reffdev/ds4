@@ -13541,6 +13541,9 @@ static bool metal_graph_verify_suffix_tops(
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
 
+    const bool verify_profile = getenv("DS4_VERIFY_PROFILE") != NULL;
+    const double vp_t0 = verify_profile ? now_sec() : 0.0;
+
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_layer_batch(g,
@@ -13552,6 +13555,9 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+
+    const double vp_layers = verify_profile ? now_sec() : 0.0;
+
     g->spec_capture_prefix1 = saved_capture;
     if (!ok) return false;
 
@@ -13572,6 +13578,15 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+
+    if (verify_profile) {
+        const double vp_done = now_sec();
+        fprintf(stderr, "ds4: verify profile n=%u layers=%.3f ms output_head=%.3f ms total=%.3f ms\n",
+                n_tokens,
+                (vp_layers - vp_t0) * 1000.0,
+                (vp_done - vp_layers) * 1000.0,
+                (vp_done - vp_t0) * 1000.0);
+    }
     if (ok && top_rows) {
         ok = ds4_gpu_tensor_read(g->comp_selected,
                                    0,
