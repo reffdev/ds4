@@ -14911,6 +14911,19 @@ static int sample_argmax(const float *logits, uint32_t n_vocab) {
     return best;
 }
 
+static float logit_prob(const float *logits, uint32_t n_vocab, int token, float temperature) {
+    if (token < 0 || (uint32_t)token >= n_vocab || temperature <= 0.0f) return 0.0f;
+    float max_l = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (logits[i] > max_l) max_l = logits[i];
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        sum += exp((double)(logits[i] - max_l) / (double)temperature);
+    }
+    return (float)(exp((double)(logits[token] - max_l) / (double)temperature) / sum);
+}
+
 static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
                         int *top0, float *logit0,
                         int *top1, float *logit1) {
@@ -17576,7 +17589,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        &e->mtp_weights,
                                        token,
                                        (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
+                                       s->mtp_logits,
                                        &mtp_top)) {
             s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
             s->mtp_draft_valid = true;
@@ -17592,9 +17605,41 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+/* N-gram lookup draft: search token history for a suffix match and return
+ * the continuation as draft tokens.  Cost is pure CPU — no GPU work. */
+static int ngram_lookup_draft(const token_vec *history, int first_draft,
+                              int *drafts, int max_drafts, int eos_token) {
+    if (!history || history->len < 4 || max_drafts <= 0) return 0;
+    const int *h = history->v;
+    const int hlen = history->len;
+    const int needle_len = 3;
+    if (hlen < needle_len + 1) return 0;
+    const int n0 = h[hlen - 2];
+    const int n1 = h[hlen - 1];
+    const int n2 = first_draft;
+    int best_pos = -1;
+    int best_cont = 0;
+    for (int p = hlen - needle_len - 1; p >= 0; p--) {
+        if (h[p] != n0 || h[p + 1] != n1 || h[p + 2] != n2) continue;
+        int cont = 0;
+        int src = p + needle_len;
+        while (cont < max_drafts && src + cont < hlen - needle_len &&
+               h[src + cont] != eos_token) {
+            cont++;
+        }
+        if (cont > best_cont) {
+            best_pos = src;
+            best_cont = cont;
+        }
+    }
+    if (best_cont == 0) return 0;
+    for (int i = 0; i < best_cont; i++) drafts[i] = h[best_pos + i];
+    return best_cont;
+}
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
- * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
+ * 2. try n-gram lookup for zero-cost drafts, then MTP for remaining slots;
  * 3. verify the suffix with the target graph, committing only the accepted
  *    prefix and rolling back speculative Metal state on miss;
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
@@ -17678,17 +17723,25 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
     if (drafts[0] == eos_token) draft_cap = 1;
     const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
-    /*
-     * MTP has its own raw SWA cache. Recursive drafting writes speculative
-     * future rows into it; after verification, rows beyond the accepted prefix
-     * must become invisible.  We do not copy/rollback the cache body because the
-     * next draft attempt will overwrite future slots.  A counter is enough.
-     */
 #define DS4_MTP_KEEP_ACCEPTED(n_) do { \
         uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
         if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
         s->graph.mtp_n_raw = keep_; \
     } while (0)
+
+    if (getenv("DS4_NGRAM_DRAFT")) {
+        int ngram_max = draft_cap - 1 < 3 ? draft_cap - 1 : 3;
+        int ngram_n = ngram_lookup_draft(&s->checkpoint, drafts[0],
+                                         drafts + 1, ngram_max, eos_token);
+        if (ngram_n > 0) {
+            draft_n = 1 + ngram_n;
+            if (mtp_timing) {
+                mtp_t_after_draft = now_sec();
+                fprintf(stderr, "ds4: ngram draft %d tokens (skipped MTP)\n", ngram_n);
+            }
+            goto ds4_verify_drafts;
+        }
+    }
 
     for (; draft_n < draft_cap; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
@@ -17764,6 +17817,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
 
+ds4_verify_drafts:
     /*
      * The useful N=2 verifier is the tiny batch path: it verifies two target
      * positions in one layer-major pass and commits prefix-1 directly on a
@@ -18193,6 +18247,184 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     n_accept);
         }
     }
+    return n_accept;
+#endif
+}
+
+int ds4_session_eval_speculative_sampling(ds4_session *s, int first_token,
+                                          int max_tokens, int eos_token,
+                                          float temperature, int top_k,
+                                          float top_p, float min_p,
+                                          uint64_t *rng,
+                                          int *accepted, int accepted_cap,
+                                          char *err, size_t errlen) {
+    if (ds4_session_is_cpu(s)) {
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
+    (void)accepted; (void)accepted_cap;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    ds4_engine *e = s->engine;
+
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
+
+    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+
+    int draft_cap = e->mtp_draft_tokens;
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap <= 0) return n_accept;
+
+    int drafts[16];
+    int draft_n = 1;
+    drafts[0] = s->mtp_draft_token;
+    s->mtp_draft_valid = false;
+    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
+
+    float p_target = logit_prob(s->logits, DS4_N_VOCAB, drafts[0], temperature);
+    float p_draft = s->mtp_logits ?
+        logit_prob(s->mtp_logits, DS4_N_VOCAB, drafts[0], temperature) : p_target;
+    float accept_prob = p_draft > 0.0f ? fminf(1.0f, p_target / p_draft) : 0.0f;
+    if (mtp_timing) {
+        fprintf(stderr, "ds4: mtp rejection p_target=%.6f p_draft=%.6f accept=%.6f draft=%d\n",
+                p_target, p_draft, accept_prob, drafts[0]);
+    }
+    float u = (float)((*rng = *rng * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) /
+              (float)(1u << 31);
+    if (u >= accept_prob) {
+        int sampled = sample_top_p_min_p(s->logits, DS4_N_VOCAB,
+                                          temperature, top_k, top_p, min_p, rng);
+        if (ds4_session_eval(s, sampled, err, errlen) != 0) return -1;
+        accepted[n_accept++] = sampled;
+        return n_accept;
+    }
+    if (drafts[0] == eos_token) draft_cap = 1;
+    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+
+    for (; draft_n < draft_cap; draft_n++) {
+        ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
+        ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
+        int mtp_top = -1;
+        if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                &e->mtp_model,
+                                                &e->mtp_weights,
+                                                prev_hc,
+                                                out_hc,
+                                                drafts[draft_n - 1],
+                                                (uint32_t)(s->checkpoint.len + draft_n - 1),
+                                                NULL,
+                                                &mtp_top))
+        {
+            if (ds4_session_eval(s, drafts[0], err, errlen) != 0) return -1;
+            accepted[n_accept++] = drafts[0];
+            return n_accept;
+        }
+        drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+        if (drafts[draft_n] == eos_token) {
+            draft_n++;
+            break;
+        }
+    }
+    double mtp_t_after_draft = mtp_timing ? now_sec() : 0.0;
+
+    const bool capture_prefix =
+        draft_n >= 2 && draft_n <= DS4_SPEC_PREFIX_MAX + 1;
+    const int start = s->checkpoint.len;
+    for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+
+    float *verify_logits = xmalloc((size_t)draft_n * DS4_N_VOCAB * sizeof(float));
+    int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
+    bool ok = metal_graph_verify_suffix_tops(&s->graph,
+                                              &e->model,
+                                              &e->weights,
+                                              &s->checkpoint,
+                                              (uint32_t)start,
+                                              (uint32_t)draft_n,
+                                              capture_prefix,
+                                              row_tops,
+                                              verify_logits);
+    if (!ok) {
+        s->checkpoint.len = start;
+        free(verify_logits);
+        free(row_tops);
+        if (ds4_session_eval(s, drafts[0], err, errlen) != 0) return -1;
+        accepted[n_accept++] = drafts[0];
+        return n_accept;
+    }
+
+    int commit_drafts = 0;
+    for (int i = 0; i < draft_n; i++) {
+        if (i >= draft_n - 1) break;
+        if (row_tops[i] != drafts[i + 1]) {
+            const float *pos_logits = verify_logits + (size_t)i * DS4_N_VOCAB;
+            int sampled = sample_top_p_min_p(pos_logits, DS4_N_VOCAB,
+                                              temperature, top_k, top_p, min_p, rng);
+            commit_drafts = i + 1;
+            s->checkpoint.len = start;
+            if (capture_prefix && commit_drafts >= 1) {
+                ok = spec_frontier_commit_prefix(s, commit_drafts - 1);
+            }
+            if (ok) {
+                const float *last_logits = verify_logits + (size_t)(commit_drafts - 1) * DS4_N_VOCAB;
+                memcpy(s->logits, last_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+                for (int j = 0; j < commit_drafts; j++) {
+                    token_vec_push(&s->checkpoint, drafts[j]);
+                    if (n_accept < accepted_cap) accepted[n_accept++] = drafts[j];
+                }
+                accepted[n_accept++] = sampled;
+                if (ds4_session_eval(s, sampled, err, errlen) != 0) {
+                    free(verify_logits);
+                    free(row_tops);
+                    return -1;
+                }
+            }
+            uint32_t keep = mtp_base_raw + (uint32_t)(commit_drafts);
+            if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+            s->graph.mtp_n_raw = keep;
+            if (mtp_timing) {
+                fprintf(stderr, "ds4: mtp sampling drafted=%d committed=%d+1 total=%.3f ms\n",
+                        draft_n, commit_drafts, (now_sec() - mtp_t0) * 1000.0);
+            }
+            free(verify_logits);
+            free(row_tops);
+            return n_accept;
+        }
+    }
+
+    commit_drafts = draft_n;
+    const float *last_logits = verify_logits + (size_t)(draft_n - 1) * DS4_N_VOCAB;
+    memcpy(s->logits, last_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+        accepted[n_accept++] = drafts[i];
+        if (drafts[i] == eos_token) break;
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    uint32_t keep = mtp_base_raw + (uint32_t)draft_n;
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
+    if (mtp_timing) {
+        fprintf(stderr, "ds4: mtp sampling drafted=%d committed=%d total=%.3f ms\n",
+                draft_n, draft_n, (now_sec() - mtp_t0) * 1000.0);
+    }
+    free(verify_logits);
+    free(row_tops);
     return n_accept;
 #endif
 }

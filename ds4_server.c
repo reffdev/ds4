@@ -7118,7 +7118,7 @@ static void generate_job(server *s, job *j) {
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
+        if (ds4_think_mode_enabled(j->req.think_mode) && thinking.inside) {
             temperature = 1.0f;
             top_k = 0;
             top_p = 1.0f;
@@ -7135,18 +7135,33 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            ntok = ds4_session_eval_speculative_argmax(s->session,
-                                                       token,
-                                                       max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            if (temperature <= 0.0f) {
+                ntok = ds4_session_eval_speculative_argmax(s->session,
+                                                           token,
+                                                           max_tokens - completion,
+                                                           ds4_token_eos(s->engine),
+                                                           toks,
+                                                           (int)(sizeof(toks) / sizeof(toks[0])),
+                                                           err,
+                                                           sizeof(err));
+            } else {
+                ntok = ds4_session_eval_speculative_sampling(s->session,
+                                                              token,
+                                                              max_tokens - completion,
+                                                              ds4_token_eos(s->engine),
+                                                              temperature,
+                                                              top_k,
+                                                              top_p,
+                                                              min_p,
+                                                              &rng,
+                                                              toks,
+                                                              (int)(sizeof(toks) / sizeof(toks[0])),
+                                                              err,
+                                                              sizeof(err));
+            }
             if (ntok < 0) {
                 finish = "error";
                 break;

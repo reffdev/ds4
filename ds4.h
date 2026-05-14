@@ -173,6 +173,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_eval_speculative_sampling(ds4_session *s, int first_token,
+                                          int max_tokens, int eos_token,
+                                          float temperature, int top_k,
+                                          float top_p, float min_p,
+                                          uint64_t *rng,
+                                          int *accepted, int accepted_cap,
+                                          char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
