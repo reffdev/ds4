@@ -10,12 +10,13 @@ Impact of this fork's optimizations on the same hardware, same model, same promp
 |--------|---------------------|-----------|--------|
 | MTP verify (2 tokens) | 370 ms | 122 ms | **3x faster** |
 | MTP generation (greedy, best) | 5.33 t/s | 10.3 t/s | **+93%** |
-| MTP generation (greedy, avg) | 5.33 t/s | 9.6 t/s | **+80%** |
-| Thinking + post-think output | 7.6 t/s | 10+ t/s | **+32%** |
+| MTP generation (greedy, avg across 5 prompts) | 5.33 t/s | 9.6 t/s | **+80%** |
+| Thinking phase (temp=1.0) | 7.6 t/s | 9.0 t/s | **+18%** |
+| Post-thinking visible text (temp=0.7) | 7.6 t/s | 10+ t/s | **+32%** |
 | Baseline (no MTP) | 9.3 t/s | 9.3 t/s | no change |
 | Prefill | 80 t/s | 80 t/s | no change |
 
-Upstream ROCm branch MTP was actively harmful (slower than no MTP). This fork makes it net-positive.
+On the upstream ROCm branch, MTP was actively harmful — slower than disabling it entirely. This fork makes MTP net-positive via fused matmul kernels, and extends it to work during thinking/sampling through rejection sampling and phase-aware temperature handling.
 
 ## Test Environment (2026-05-13)
 
@@ -43,7 +44,7 @@ Upstream ROCm branch MTP was actively harmful (slower than no MTP). This fork ma
 | Prefill | 80 t/s | Sustained, 2048-token chunks |
 | KV cache at 64k context | 883 MB | MLA compression |
 
-### Benchmark sweep (ds4-bench, greedy, no MTP)
+### Benchmark sweep (ds4-bench, greedy, no MTP, upstream ROCm branch)
 
 | Context | Prefill (t/s) | Generation (t/s) | KV Cache |
 |---------|--------------|-------------------|----------|
@@ -240,6 +241,19 @@ Draft depths >2 are not profitable with the current MTP model but the prefix-K i
 - **XNACK is not supported** on gfx1151. HSA zero-copy via raw mmap pointers is not possible; `hipHostRegister` is required.
 - **ROCm tuning env vars** (`GPU_MAX_HW_QUEUES`, `HSA_ENABLE_SDMA`, `HIP_FORCE_DEV_KERNARG`) had no measurable effect on this hardware.
 - **Context size has no impact on generation speed** — MLA compressed KV cache is so small that even 256k context doesn't affect per-token speed.
+
+## What Was Explored and Ruled Out
+
+The following optimizations were investigated and found not viable on this hardware/model combination:
+
+- **HSA zero-copy memory**: Skipping `hipHostRegister` and passing raw mmap pointers directly to GPU kernels. Crashes immediately — gfx1151 does not support XNACK (GPU page faulting into host memory). Registration is required.
+- **Deeper MTP drafting (draft=3-8)**: The single-layer MTP model's accuracy drops sharply beyond depth 2 (~74% at depth 1, ~52% at depth 2, worse beyond). Each extra draft costs 18ms with diminishing returns. Draft=2 is optimal.
+- **Adaptive draft depth**: Dynamically increasing draft count when the MTP model is confident. Tested both margin-based (check logit confidence) and ramp-based (TCP-style congestion control). Both slower than fixed draft=2 due to logit readback overhead and low accuracy at depth 3+.
+- **N-gram lookahead drafting**: Search token history for repeated patterns and propose continuations at zero GPU cost. Works well on dense models but not profitable on MoE — verification of extra tokens loads additional expert weights, overwhelming the free draft generation. Left behind `DS4_NGRAM_DRAFT=1` for future experimentation.
+- **F16 weight cache for small batch**: The existing F16 dequantization cache uses hipBLAS GemmEx for batched matmuls. For n_tok <= 4, this is slower than the native Q8_0 kernel on RDNA 3.5 due to hipBLAS dispatch overhead.
+- **ROCm environment variable tuning**: `GPU_MAX_HW_QUEUES`, `HSA_ENABLE_SDMA`, `HIP_FORCE_DEV_KERNARG`, model prefetch/advise settings — all tested with no measurable effect.
+- **Requantizing Q8_0 components to Q6_K/Q5_K**: The ds4 quantize tool only supports Q8_0, Q4_K, Q2_K, and IQ2_XXS as targets. Q6_K and Q5_K are not available. Q4_K is possible but the attention/shared-expert weights were kept at Q8_0 deliberately for quality.
+- **Flash attention rewrite**: Already implemented in the codebase as online/streaming attention kernels. The naive attention kernel is only used when scores fit in shared memory (short contexts), where it's adequate.
 
 ## Upstream
 
