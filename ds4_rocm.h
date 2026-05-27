@@ -93,11 +93,14 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventDisableTiming hipEventDisableTiming
 
 /* ---------- Kernel attributes ---------- */
-#define cudaFuncSetAttribute hipFuncSetAttribute
+/* HIP expects const void* for the function pointer; CUDA allows bare kernel names. */
+#define cudaFuncSetAttribute(func, attr, val) \
+    hipFuncSetAttribute((const void*)(func), (attr), (val))
 #define cudaFuncAttributeMaxDynamicSharedMemorySize \
     hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin \
     hipDeviceAttributeSharedMemPerBlockOptin
+
 
 /* ---------- cuBLAS / hipBLAS ---------- */
 #define cublasHandle_t hipblasHandle_t
