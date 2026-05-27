@@ -8551,21 +8551,23 @@ typedef struct {
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
      * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
-     * common N=2 case. */
+     * frontiers.  The prefix buffers are the cheap partial-accept state:
+     * prefix[k] holds compressor state after the k-th draft token. */
     ds4_gpu_tensor *spec_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_index_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
+#define DS4_SPEC_PREFIX_MAX 7
+    ds4_gpu_tensor *spec_prefix_attn_state_kv[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_prefix_attn_state_score[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_prefix_index_state_kv[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_prefix_index_state_score[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
-    bool spec_capture_prefix1;
+    uint32_t spec_prefix_n_comp[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
+    uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
+    int spec_capture_prefix_max;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -8836,10 +8838,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_attn_state_score[il]);
         ds4_gpu_tensor_free(g->spec_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_index_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
-        ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
+        for (int pk = 0; pk < DS4_SPEC_PREFIX_MAX; pk++) {
+            ds4_gpu_tensor_free(g->spec_prefix_attn_state_kv[pk][il]);
+            ds4_gpu_tensor_free(g->spec_prefix_attn_state_score[pk][il]);
+            ds4_gpu_tensor_free(g->spec_prefix_index_state_kv[pk][il]);
+            ds4_gpu_tensor_free(g->spec_prefix_index_state_score[pk][il]);
+        }
     }
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
@@ -9261,8 +9265,10 @@ static bool metal_graph_alloc_raw_cap(
             if (enable_mtp) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                for (int pk = 0; pk < DS4_SPEC_PREFIX_MAX; pk++) {
+                    g->spec_prefix_attn_state_kv[pk][il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                    g->spec_prefix_attn_state_score[pk][il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                }
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -9284,8 +9290,10 @@ static bool metal_graph_alloc_raw_cap(
                 if (enable_mtp) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    for (int pk = 0; pk < DS4_SPEC_PREFIX_MAX; pk++) {
+                        g->spec_prefix_index_state_kv[pk][il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                        g->spec_prefix_index_state_score[pk][il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    }
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -9408,8 +9416,8 @@ static bool metal_graph_alloc_raw_cap(
                              (!enable_mtp ||
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL &&
-                               g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                               g->spec_prefix_attn_state_kv[0][il] != NULL &&
+                               g->spec_prefix_attn_state_score[0][il] != NULL));
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
@@ -9418,8 +9426,8 @@ static bool metal_graph_alloc_raw_cap(
                              (!enable_mtp ||
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL &&
-                               g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                               g->spec_prefix_index_state_kv[0][il] != NULL &&
+                               g->spec_prefix_index_state_score[0][il] != NULL));
         }
     }
 
@@ -9517,23 +9525,25 @@ static uint32_t metal_graph_raw_start_for_span(
  * not evict visible raw rows.  If the raw cache is ever reduced to a strict
  * 128-row ring, speculative raw rows must become shadow rows and be copied
  * into the ring only on commit. */
-static bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_attn_state(ds4_gpu_graph *g, uint32_t il, int pk) {
+    if (pk < 0 || pk >= DS4_SPEC_PREFIX_MAX) return true;
+    if (pk >= g->spec_capture_prefix_max || !g->spec_prefix_attn_state_kv[pk][il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-    g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
+    g->spec_prefix_n_comp[pk][il] = g->layer_n_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix_attn_state_kv[pk][il], 0,
                                  g->layer_attn_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
+           ds4_gpu_tensor_copy(g->spec_prefix_attn_state_score[pk][il], 0,
                                  g->layer_attn_state_score[il], 0, bytes) != 0;
 }
 
-static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_index_state(ds4_gpu_graph *g, uint32_t il, int pk) {
+    if (pk < 0 || pk >= DS4_SPEC_PREFIX_MAX) return true;
+    if (pk >= g->spec_capture_prefix_max || !g->spec_prefix_index_state_kv[pk][il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
+    g->spec_prefix_n_index_comp[pk][il] = g->layer_n_index_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix_index_state_kv[pk][il], 0,
                                  g->layer_index_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+           ds4_gpu_tensor_copy(g->spec_prefix_index_state_score[pk][il], 0,
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
@@ -12431,7 +12441,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
-                    if (ok && t == 0) ok = metal_graph_capture_prefix1_attn_state(g, il);
+                    if (ok) ok = metal_graph_capture_prefix_attn_state(g, il, (int)t);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -12721,7 +12731,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
-                        if (ok && t == 0) ok = metal_graph_capture_prefix1_index_state(g, il);
+                        if (ok) ok = metal_graph_capture_prefix_index_state(g, il, (int)t);
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -14410,8 +14420,8 @@ static bool metal_graph_verify_suffix_tops(
                                                          n_tokens);
     if (!ok) return false;
 
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
+    const int saved_capture = g->spec_capture_prefix_max;
+    g->spec_capture_prefix_max = capture_prefix1 ? (int)(n_tokens - 1) : 0;
 
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -14424,7 +14434,7 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_max = saved_capture;
     if (!ok) return false;
 
     ok = ds4_gpu_begin_commands() != 0;
@@ -14514,8 +14524,8 @@ static bool metal_graph_verify_decode2_exact(
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = true;
+    const int saved_capture = g->spec_capture_prefix_max;
+    g->spec_capture_prefix_max = 1;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t pos0 = start;
@@ -14534,8 +14544,8 @@ static bool metal_graph_verify_decode2_exact(
                                              metal_graph_raw_span_for_batch(g, pos0, 1),
                                              token0);
         if (!ok) break;
-        ok = metal_graph_capture_prefix1_attn_state(g, il) &&
-             metal_graph_capture_prefix1_index_state(g, il);
+        ok = metal_graph_capture_prefix_attn_state(g, il, 0) &&
+             metal_graph_capture_prefix_index_state(g, il, 0);
         if (!ok) break;
 
         g->cur_hc = cur1;
@@ -14557,7 +14567,7 @@ static bool metal_graph_verify_decode2_exact(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_max = saved_capture;
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
 
@@ -14598,7 +14608,7 @@ static bool metal_graph_verify_decode2_exact(
     }
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix_max = saved_capture;
 
     ds4_gpu_tensor_free(next1);
     ds4_gpu_tensor_free(next0);
@@ -16840,34 +16850,34 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     return ok;
 }
 
-/* Commit the prefix-1 state captured by the N=2 speculative verifier.
+/* Commit the prefix-K state captured by the speculative verifier.
  *
- * The verifier has already advanced every layer through both draft tokens.  On
- * a one-token accept the append-only compressed caches can keep the second
- * speculative row as invisible garbage, but the compressor frontiers and row
- * counters must be rewound to the exact state after draft[0].  This is the
- * cheap partial-accept path: copy a few small per-layer frontiers instead of
- * restoring the whole prefix and replaying a one-token target decode. */
-static bool spec_frontier_commit_prefix1(ds4_session *s) {
+ * The verifier has already advanced every layer through all draft tokens.
+ * On partial accept, the compressor frontiers and row counters must be
+ * rewound to the state after the last accepted draft token.  pk is the
+ * 0-based index of that token's captured state (e.g. pk=0 means accept
+ * only draft[0], pk=1 means accept draft[0]+draft[1], etc.). */
+static bool spec_frontier_commit_prefix(ds4_session *s, int pk) {
+    if (pk < 0 || pk >= DS4_SPEC_PREFIX_MAX) return false;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
 
-        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
+        g->layer_n_comp[il] = g->spec_prefix_n_comp[pk][il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_prefix1_attn_state_kv[il], 0, ab) != 0 &&
+                                   g->spec_prefix_attn_state_kv[pk][il], 0, ab) != 0 &&
              ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_prefix1_attn_state_score[il], 0, ab) != 0;
+                                   g->spec_prefix_attn_state_score[pk][il], 0, ab) != 0;
         if (ok && ratio == 4) {
-            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
+            g->layer_n_index_comp[il] = g->spec_prefix_n_index_comp[pk][il];
             const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
             ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
+                                       g->spec_prefix_index_state_kv[pk][il], 0, ib) != 0 &&
                  ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+                                       g->spec_prefix_index_state_score[pk][il], 0, ib) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -18901,7 +18911,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
         if (ok) {
             s->checkpoint.len = start;
-            ok = spec_frontier_commit_prefix1(s);
+            ok = spec_frontier_commit_prefix(s, 0);
         }
         if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         if (ok) {
@@ -18953,11 +18963,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
          * the older no-replay partial path for measurement.
          */
         const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
+            draft_n >= 2 && draft_n <= DS4_SPEC_PREFIX_MAX + 1 &&
+            (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
         const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
         const bool snapshot_required =
-            draft_n > 2 ||
-            (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
+            (!capture_prefix1 || exact_replay_debug) ||
             getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
         bool have_frontier = false;
         bool ok = true;
@@ -19060,19 +19070,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 }
             }
 
-            if (draft_n == 2 && commit_drafts == 1 && capture_prefix1) {
+            if (commit_drafts < draft_n && commit_drafts >= 1 && capture_prefix1) {
                 s->checkpoint.len = start;
                 const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
-                ok = spec_frontier_commit_prefix1(s);
+                ok = spec_frontier_commit_prefix(s, commit_drafts - 1);
                 const double prefix_done = mtp_timing ? now_sec() : 0.0;
-                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
+                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(commit_drafts - 1), row_logits);
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    accepted[n_accept++] = drafts[0];
+                    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+                        accepted[n_accept++] = drafts[i];
+                        if (drafts[i] == eos_token) break;
+                    }
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
-                    token_vec_push(&s->checkpoint, drafts[0]);
+                    DS4_MTP_KEEP_ACCEPTED(commit_drafts);
+                    for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
                     if (mtp_timing) {
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
