@@ -1,8 +1,12 @@
+#ifdef __HIP_PLATFORM_AMD__
+#include "ds4_rocm.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#endif
 
 #include <stdint.h>
 #include <errno.h>
@@ -4574,7 +4578,7 @@ __global__ static void indexer_scores_wmma_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || (__CUDA_ARCH__ >= 700)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -4682,7 +4686,7 @@ __global__ static void indexer_scores_wmma32_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || (__CUDA_ARCH__ >= 700)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 32u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -4798,7 +4802,7 @@ __global__ static void indexer_scores_wmma64_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || (__CUDA_ARCH__ >= 700)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 64u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -4914,7 +4918,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || (__CUDA_ARCH__ >= 700)
     namespace wmma = nvcuda::wmma;
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
@@ -5891,7 +5895,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              out->ptr,
                                              CUDA_R_32F,
                                              (int)out_dim,
-                                             CUDA_R_32F,
+                                             CUBLAS_COMPUTE_32F,
                                              CUBLAS_GEMM_DEFAULT);
             if (st == CUBLAS_STATUS_SUCCESS) return 1;
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
@@ -6133,7 +6137,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          out->ptr,
                                          CUDA_R_32F,
                                          (int)out_dim,
-                                         CUDA_R_32F,
+                                         CUBLAS_COMPUTE_32F,
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
@@ -7465,7 +7469,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        (int)rank,
                                                        (long long)rank * n_tokens,
                                                        (int)n_groups,
-                                                       CUDA_R_32F,
+                                                       CUBLAS_COMPUTE_32F,
                                                        CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention output a gemm")) return 0;
         attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
